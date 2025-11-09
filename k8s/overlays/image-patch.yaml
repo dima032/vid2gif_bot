@@ -1,10 +1,11 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: video-gif-bot
+  name: video2gif-bot
+  namespace: bots
 spec:
   template:
     spec:
       containers:
-        - name: video-gif-bot
-          image: dima032398485/video2gif_bot:latest
+        - name: video2gif-bot
+          image: dima032398485/vid2gif_bot:latest

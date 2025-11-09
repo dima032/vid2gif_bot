@@ -1,28 +1,30 @@
 ---
-name: Docker image CI
+name: Build and Push Docker Image
+
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+    paths:
+      - 'bot/**'
+      - '.github/workflows/dockerhub.yaml'
+
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v2
+      - uses: actions/checkout@v4
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push Reddit Bot image
-        uses: docker/build-push-action@v4
+      
+      - name: Build and push
+        uses: docker/build-push-action@v5
         with:
           context: ./bot
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/vid2gif_bot:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/vid2gif_bot:${{ github.sha }}
-...
+            dima032398485/vid2gif_bot:latest
+            dima032398485/vid2gif_bot:${{ github.sha }}

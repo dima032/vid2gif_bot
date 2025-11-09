@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+images:
+- name: dima032398485/vid2gif_bot
+  newTag: latest
+
+patches:
+- path: image-updater.yaml
+  target:
+    name: dima032398485/vid2gif_bot
+    kind: Deployment
+  patch: |-
+    - op: replace
+      path: /spec/template/spec/containers/0/image
+      value: dima032398485/vid2gif_bot:latest

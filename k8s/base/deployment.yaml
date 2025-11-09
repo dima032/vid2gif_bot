@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: video2gif-bot
+  namespace: bots
   labels:
     app: video2gif-bot
 spec:
@@ -15,9 +16,11 @@ spec:
         app: video2gif-bot
     spec:
       serviceAccountName: video2gif-bot-sa
+      securityContext:
+        fsGroup: 1000
       containers:
         - name: video2gif-bot
-          image: dima032398485/video2gif_bot:latest
+          image: dima032398485/vid2gif_bot:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: VIDEO2GIF_BOT_TOKEN

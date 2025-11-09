@@ -4,9 +4,11 @@ import tempfile
 import shutil
 import subprocess
 from pathlib import Path
+import asyncio
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import TimedOut, NetworkError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -17,6 +19,9 @@ TOKEN = os.getenv('VIDEO2GIF_BOT_TOKEN')
 if not TOKEN:
 	logger.error('Environment variable VIDEO2GIF_BOT_TOKEN is not set')
 	raise SystemExit('VIDEO2GIF_BOT_TOKEN required')
+
+# Maximum file size for Telegram (50MB)
+MAX_FILE_SIZE = 50 * 1024 * 1024  
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -54,6 +59,58 @@ def _run_ffmpeg_palette_use(input_path: Path, palette_path: Path, out_path: Path
 		cmd += ['-t', str(max_duration)]
 	cmd += ['-lavfi', vf + '[x];[x][1:v]paletteuse', str(out_path)]
 	subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+async def compress_gif(input_path, max_size=MAX_FILE_SIZE):
+    """Compress GIF if it's too large"""
+    if os.path.getsize(input_path) <= max_size:
+        return input_path
+        
+    output_path = input_path.replace('.gif', '_compressed.gif')
+    try:
+        # Reduce colors and quality until file size is acceptable
+        cmd = [
+            'convert', input_path,
+            '-colors', '128',
+            '-quality', '60',
+            output_path
+        ]
+        subprocess.run(cmd, check=True)
+        
+        if os.path.getsize(output_path) <= max_size:
+            return output_path
+            
+        # If still too large, reduce resolution
+        cmd = [
+            'convert', input_path,
+            '-resize', '50%',
+            '-colors', '64',
+            '-quality', '50',
+            output_path
+        ]
+        subprocess.run(cmd, check=True)
+        return output_path
+    except subprocess.CalledProcessError:
+        return input_path
+
+
+async def retry_send_animation(bot, chat_id, animation_path, max_retries=3):
+    """Retry sending animation with exponential backoff"""
+    for attempt in range(max_retries):
+        try:
+            with open(animation_path, 'rb') as animation:
+                await bot.send_animation(
+                    chat_id=chat_id,
+                    animation=animation,
+                    read_timeout=60,
+                    write_timeout=60
+                )
+            return True
+        except (TimedOut, NetworkError) as e:
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(2 ** attempt)
+    return False
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -111,8 +168,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 				await msg.reply_text(f'GIF is too large to send ({size/1024/1024:.1f} MB). Try a shorter clip.')
 				return
 
+			# Compress if needed
+			final_gif = await compress_gif(out_gif)
+
 			# Send the resulting GIF
-			await context.bot.send_animation(chat_id=msg.chat_id, animation=open(out_gif, 'rb'))
+			await retry_send_animation(context.bot, msg.chat_id, final_gif)
 			await msg.reply_text('Done!')
 		except subprocess.CalledProcessError as e:
 			logger.exception('ffmpeg failed: %s', e)
