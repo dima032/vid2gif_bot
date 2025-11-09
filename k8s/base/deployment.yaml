@@ -20,7 +20,7 @@ spec:
           image: dima032398485/video2gif_bot:latest
           imagePullPolicy: IfNotPresent
           env:
-            - name: TELEGRAM_VIDEO2GIF_BOT_TOKEN
+            - name: VIDEO2GIF_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: video2gif-bot-secrets
