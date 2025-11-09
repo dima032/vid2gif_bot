@@ -1,0 +1,28 @@
+---
+name: Docker image CI
+on:
+  push:
+    branches:
+      - main
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Reddit Bot image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./bot
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/vid2gif_bot:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/vid2gif_bot:${{ github.sha }}
+...
