@@ -20,8 +20,8 @@ spec:
         fsGroup: 1000
       containers:
         - name: video2gif-bot
-          image: dima032398485/vid2gif_bot:latest
-          imagePullPolicy: IfNotPresent
+          image: dima032398485/vid2gif_bot:latest # updated line
+          imagePullPolicy: Always
           env:
             - name: VIDEO2GIF_BOT_TOKEN
               valueFrom:
