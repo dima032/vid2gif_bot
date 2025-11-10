@@ -22,7 +22,9 @@ if not TOKEN:
 	raise SystemExit('VIDEO2GIF_BOT_TOKEN required')
 
 # Maximum file size for Telegram (50MB)
-MAX_FILE_SIZE = 50 * 1024 * 1024  
+MAX_FILE_SIZE = 50 * 1024 * 1024
+# Preferred maximum GIF size for conversations (can be tuned via env var, MB)
+MAX_GIF_SIZE = int(os.getenv('VIDEO2GIF_MAX_GIF_SIZE_MB', '3')) * 1024 * 1024
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -62,37 +64,81 @@ def _run_ffmpeg_palette_use(input_path: Path, palette_path: Path, out_path: Path
 	subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
-async def compress_gif(input_path, max_size=MAX_FILE_SIZE):
-    """Compress GIF if it's too large"""
-    if os.path.getsize(input_path) <= max_size:
-        return input_path
-        
-    output_path = input_path.replace('.gif', '_compressed.gif')
-    try:
-        # Reduce colors and quality until file size is acceptable
-        cmd = [
-            'convert', input_path,
-            '-colors', '128',
-            '-quality', '60',
-            output_path
-        ]
-        subprocess.run(cmd, check=True)
-        
-        if os.path.getsize(output_path) <= max_size:
-            return output_path
-            
-        # If still too large, reduce resolution
-        cmd = [
-            'convert', input_path,
-            '-resize', '50%',
-            '-colors', '64',
-            '-quality', '50',
-            output_path
-        ]
-        subprocess.run(cmd, check=True)
-        return output_path
-    except subprocess.CalledProcessError:
-        return input_path
+async def compress_gif(input_path, max_size=MAX_GIF_SIZE):
+	"""Try several tools/strategies to reduce GIF size until it's <= max_size.
+
+	Strategies tried (in order):
+	  1. gifsicle color reduction and optimization (fast, high quality)
+	  2. ImageMagick convert with resize + color reduction + optimization
+	  3. ffmpeg re-encode with progressively lower fps and width
+
+	Returns path to the (possibly new) GIF to send. If no tool is available or
+	compression can't reduce below max_size, returns original path.
+	"""
+	inp = Path(input_path)
+	try:
+		size = inp.stat().st_size
+	except Exception:
+		return str(input_path)
+
+	if size <= max_size:
+		return str(input_path)
+
+	workdir = inp.parent
+	gifsicle = shutil.which('gifsicle')
+	convert = shutil.which('convert')
+
+	# 1) gifsicle color reduction / optimization
+	if gifsicle:
+		try:
+			last = inp
+			for colors in (128, 64, 32, 16, 8):
+				out = workdir / f'{inp.stem}_gfs_{colors}.gif'
+				cmd = [gifsicle, '--optimize=3', f'--colors={colors}', str(last), '-o', str(out)]
+				subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+				if out.exists() and out.stat().st_size <= max_size:
+					return str(out)
+				last = out
+		except subprocess.CalledProcessError:
+			pass
+
+	# 2) ImageMagick convert (resize + colors + optimize)
+	if convert:
+		try:
+			for scale_pct in (75, 50, 40):
+				for colors in (64, 32, 16):
+					out = workdir / f'{inp.stem}_magick_{scale_pct}_{colors}.gif'
+					cmd = [
+						convert, str(inp), '-coalesce',
+						'-resize', f'{scale_pct}%',
+						'-colors', str(colors),
+						'-layers', 'Optimize',
+						str(out)
+					]
+					subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+					if out.exists() and out.stat().st_size <= max_size:
+						return str(out)
+		except subprocess.CalledProcessError:
+			pass
+
+	# 3) Re-encode with ffmpeg lower fps/width using palette method
+	try:
+		for fps in (12, 10, 8, 6, 5):
+			for width in (480, 360, 240, 160):
+				pal = workdir / f'{inp.stem}_pal_{fps}_{width}.png'
+				candidate = workdir / f'{inp.stem}_ff_{fps}_{width}.gif'
+				try:
+					_run_ffmpeg_generate_palette(inp, pal, None, fps, width)
+					_run_ffmpeg_palette_use(inp, pal, candidate, None, fps, width)
+				except Exception:
+					continue
+				if candidate.exists() and candidate.stat().st_size <= max_size:
+					return str(candidate)
+	except Exception:
+		pass
+
+	# Nothing worked; return original GIF
+	return str(input_path)
 
 
 async def retry_send_animation(bot, chat_id, animation_path, max_retries=3):

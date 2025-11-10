@@ -4,7 +4,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Install ffmpeg and other small deps
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends \
+       ffmpeg \
+       gifsicle \
+       imagemagick \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

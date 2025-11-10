@@ -20,7 +20,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: video2gif-bot
-          image: dima032398485/vid2gif_bot:latest # updated line
+          image: dima032398485/vid2gif_bot:latest
           imagePullPolicy: Always
           env:
             - name: VIDEO2GIF_BOT_TOKEN
@@ -28,10 +28,23 @@ spec:
                 secretKeyRef:
                   name: video2gif-bot-secrets
                   key: tg_video2gif_bot_token
+            - name: VIDEO2GIF_MAX_GIF_SIZE_MB
+              value: "3"
+            - name: MAGICK_THREAD_LIMIT
+              value: "1"
+            - name: OMP_NUM_THREADS
+              value: "1"
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
+              cpu: "500m"
+              memory: "512Mi"
             limits:
-              cpu: "250m"
-              memory: "256Mi"
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: temp-storage
+              mountPath: /tmp
+      volumes:
+        - name: temp-storage
+          emptyDir:
+            sizeLimit: "2Gi"
