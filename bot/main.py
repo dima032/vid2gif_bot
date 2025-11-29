@@ -77,6 +77,50 @@ def _run_ffmpeg_palette_use(input_path: Path, palette_path: Path, out_path: Path
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
+def _parse_ffprobe_fps(fps_str: str) -> float:
+    """Parse FPS string from ffprobe (e.g., '30/1' or '29.97')."""
+    try:
+        if '/' in fps_str:
+            num, den = map(int, fps_str.split('/'))
+            return num / den if den != 0 else 15.0
+        return float(fps_str)
+    except (ValueError, ZeroDivisionError):
+        return 15.0  # A sensible default
+
+
+def _get_video_metadata(video_path: Path) -> dict | None:
+    """Run ffprobe to get video metadata."""
+    ffprobe = shutil.which('ffprobe')
+    if not ffprobe:
+        logger.warning('ffprobe not found, cannot get video metadata.')
+        return None
+
+    cmd = [
+        ffprobe,
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height,r_frame_rate,duration',
+        '-of', 'csv=p=0',
+        str(video_path)
+    ]
+    try:
+        # Use synchronous subprocess.run consistent with other calls
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=15)
+        output = result.stdout.strip()
+
+        width, height, fps_str, duration_str = output.split(',')
+
+        return {
+            'width': int(width),
+            'height': int(height),
+            'fps': _parse_ffprobe_fps(fps_str),
+            'duration': float(duration_str)
+        }
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as e:
+        logger.exception(f"Failed to get video metadata for {video_path}: {e}")
+        return None
+
+
 async def compress_gif(input_path, max_size=MAX_GIF_SIZE):
     """Try several tools/strategies to reduce GIF size until it's <= max_size.
 
@@ -370,113 +414,89 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text('Failed to download the file. Please try again later.')
                 return
 
-        # Conversion parameters (reasonable defaults)
-        # If input is large, be aggressive up-front to avoid creating very large GIFs
-        infile_size = None
-        try:
-            infile_size = infile_path.stat().st_size
-        except Exception:
-            infile_size = None
-
-        # default
-        max_duration = 15  # seconds, trim longer videos
-        fps = 15
-        scale_width = 480  # scale width, keep aspect ratio
-
-        # If the uploaded video is big, start with smaller defaults to keep gif size manageable
-        if infile_size and infile_size > (8 * 1024 * 1024):  # >8MB
-            max_duration = min(max_duration, 12)
-            fps = 12
-            scale_width = 360
-        elif infile_size and infile_size > (20 * 1024 * 1024):
-            # very large uploads: be more aggressive
-            max_duration = min(max_duration, 10)
-            fps = 10
-            scale_width = 320
-
         try:
             logger.info('Starting conversion for chat=%s message_id=%s', msg.chat_id, msg.message_id)
-            await msg.reply_text('Converting to GIF (this may take a few seconds)...')
-            
-            # Generate palette and then use it for better colors (parameters chosen above)
-            _run_ffmpeg_generate_palette(infile_path, palette, max_duration, fps, scale_width)
-            logger.info('Palette generated: %s', palette)
-            _run_ffmpeg_palette_use(infile_path, palette, out_gif, max_duration, fps, scale_width)
-            logger.info('GIF generated: %s (size=%.1fKB)', out_gif.name, out_gif.stat().st_size/1024)
-            # Check size (Telegram bots have file size limits - commonly 50 MB)
-            max_send_size = 50 * 1024 * 1024
-            size = out_gif.stat().st_size
-            if size > max_send_size:
-                await msg.reply_text(f'GIF is too large to send ({size/1024/1024:.1f} MB). Try a shorter clip.')
+            await msg.reply_text('Analyzing video properties...')
+
+            # Get video metadata to make smarter conversion decisions
+            metadata = _get_video_metadata(infile_path)
+            if not metadata:
+                await msg.reply_text('Failed to read video metadata. Cannot convert.')
                 return
 
-            # Compress if needed
-            final_gif = await compress_gif(out_gif)
-            try:
-                final_size = Path(final_gif).stat().st_size
-                logger.info('Final GIF selected: %s size=%.1fKB', Path(final_gif).name, final_size/1024)
-                # Inform user about final size before sending
-                try:
-                    sent = await retry_send_text_by_msg(msg, f'Prepared GIF: {Path(final_gif).name} ({final_size/1024:.1f} KB). Sending now...')
-                    if not sent:
-                        logger.warning('Could not deliver prepared-GIF progress message after retries')
-                except Exception:
-                    logger.exception('Failed to send progress message to user')
-            except Exception:
-                logger.exception('Failed to stat final GIF %s', final_gif)
+            # Smartly determine conversion parameters based on metadata
+            duration = metadata['duration']
+            fps = metadata['fps']
+            width = metadata['width']
+            height = metadata['height']
 
-            # If the final GIF is still larger than our preferred GIF size, try one
-            # more aggressive GIF re-encode (lower fps and width) and re-run compression.
-            try:
-                final_size = Path(final_gif).stat().st_size
-            except Exception:
-                final_size = None
-
-            if final_size and final_size > MAX_GIF_SIZE:
-                logger.info('Final GIF %s is larger than preferred max (%d bytes). Trying aggressive re-encode.', final_gif, MAX_GIF_SIZE)
-                await msg.reply_text('GIF is still large after compression — trying a more aggressive small GIF.')
-                
-                # aggressive parameters (keep more fps/quality by default than before)
-                # Raise defaults to preserve smoother motion; users can still override via env.
-                aggressive_fps = int(os.getenv('VIDEO2GIF_AGGRESSIVE_FPS', '10'))
-                aggressive_width = int(os.getenv('VIDEO2GIF_AGGRESSIVE_WIDTH', '320'))
-                aggressive_gif = td_path / 'out_aggressive.gif'
-                
-                try:
-                    # Recreate palette + aggressive gif
-                    _run_ffmpeg_generate_palette(infile_path, palette, max_duration, aggressive_fps, aggressive_width)
-                    _run_ffmpeg_palette_use(infile_path, palette, aggressive_gif, max_duration, aggressive_fps, aggressive_width)
-                    logger.info('Aggressive GIF generated: %s (size=%.1fKB)', aggressive_gif.name, aggressive_gif.stat().st_size/1024)
-
-                    # Try compressing the aggressive GIF as well
-                    final_gif_candidate = await compress_gif(aggressive_gif)
-                    try:
-                        final_candidate_size = Path(final_gif_candidate).stat().st_size
-                        logger.info('Final aggressive GIF selected: %s size=%.1fKB', Path(final_gif_candidate).name, final_candidate_size/1024)
-                        sent = await retry_send_text_by_msg(msg, f'Prepared small GIF: {Path(final_gif_candidate).name} ({final_candidate_size/1024:.1f} KB). Sending now...')
-                        if not sent:
-                            logger.warning('Could not deliver aggressive prepared-GIF progress message after retries')
-                    except Exception:
-                        logger.exception('Failed to stat aggressive GIF %s', final_gif_candidate)
-                    
-                    # send whichever candidate we got
-                    await retry_send_animation(context.bot, msg.chat_id, final_gif_candidate)
-                    await msg.reply_text('Done!')
-
-                except subprocess.CalledProcessError as e:
-                    logger.exception('ffmpeg aggressive re-encode failed: %s', e)
-                    await msg.reply_text('Failed to produce a smaller GIF after aggressive attempts. Sending the best GIF we have...')
-                    await retry_send_animation(context.bot, msg.chat_id, final_gif)
-                    await msg.reply_text('Done!')
-                except Exception as e:
-                    logger.exception('Unexpected error during aggressive GIF generation: %s', e)
-                    await msg.reply_text('Unexpected error while producing smaller GIF. Sending the best GIF we have...')
-                    await retry_send_animation(context.bot, msg.chat_id, final_gif)
-                    await msg.reply_text('Done!')
+            # 1. Cap duration to a reasonable length for a GIF
+            max_duration = 15.0
+            if duration > max_duration:
+                await retry_send_text_by_msg(msg, f"Video is {duration:.1f}s long; trimming to {max_duration}s for the GIF.")
+                duration = max_duration
             else:
-                # Send the resulting GIF
-                await retry_send_animation(context.bot, msg.chat_id, final_gif)
-                await msg.reply_text('Done!')
+                max_duration = None  # Use full length if shorter than max
+
+            # 2. Iteratively adjust FPS and width to meet a "pixel budget"
+            # This is a heuristic to estimate output size before conversion.
+            # A 480p, 15fps, 10s video is a good baseline (480*270*15*10 = ~20M "pixels")
+            pixel_budget = 25_000_000
+            pixel_score = width * height * fps * (duration or metadata['duration'])
+
+            scale_width = width
+            final_fps = min(fps, 30)  # Cap source FPS at 30
+
+            # If the estimated "pixel score" is high, be more aggressive from the start.
+            if pixel_score > pixel_budget and width > 320: # only if score is high and res is not already low
+                await retry_send_text_by_msg(msg, "Video has high resolution/fps. Applying smart compression to create a smaller GIF...")
+                
+                # Reduce width and fps based on how much it's over budget
+                reduction_factor = (pixel_score / pixel_budget) ** 0.5  # sqrt makes reduction less drastic
+                
+                scale_width = int(width / reduction_factor)
+                final_fps = int(fps / reduction_factor)
+
+                # Clamp to reasonable values for a GIF
+                scale_width = max(min(scale_width, 480), 320)  # Clamp between 320p and 480p width
+                final_fps = max(min(final_fps, 15), 10)  # Clamp between 10 and 15 fps
+            else:
+                # Looks good, use default high-quality settings
+                scale_width = min(width, 480)  # Don't upscale, but cap at 480p for sanity
+                final_fps = min(fps, 15)  # 15 fps is a good default for GIFs
+
+            await retry_send_text_by_msg(msg, f'Converting to GIF ({scale_width}p width, {final_fps} fps)...')
+            
+            # Generate palette and then use it for better colors
+            _run_ffmpeg_generate_palette(infile_path, palette, max_duration, final_fps, scale_width)
+            logger.info('Palette generated: %s', palette)
+            _run_ffmpeg_palette_use(infile_path, palette, out_gif, max_duration, final_fps, scale_width)
+            
+            initial_size = out_gif.stat().st_size
+            logger.info('GIF generated: %s (size=%.1fKB)', out_gif.name, initial_size / 1024)
+
+            # Check against Telegram's hard limit
+            if initial_size > MAX_FILE_SIZE:
+                await msg.reply_text(f'Generated GIF is too large to send ({initial_size / 1024 / 1024:.1f} MB). Try a shorter clip.')
+                return
+
+            # Compress if needed to get under the preferred conversational size
+            if initial_size > MAX_GIF_SIZE:
+                await retry_send_text_by_msg(msg, f'Initial GIF is {initial_size / 1024 / 1024:.1f}MB, running post-compression...')
+            final_gif_path = await compress_gif(out_gif, max_size=MAX_GIF_SIZE)
+            
+            final_gif = Path(final_gif_path)
+            final_size = final_gif.stat().st_size
+            logger.info('Final GIF selected: %s size=%.1fKB', final_gif.name, final_size / 1024)
+
+            if final_size > MAX_GIF_SIZE:
+                await retry_send_text_by_msg(msg, f'Compressed GIF is still {final_size / 1024 / 1024:.1f}MB. Sending the smallest version we have.')
+            else:
+                await retry_send_text_by_msg(msg, f'Prepared GIF: {final_gif.name} ({final_size/1024:.1f} KB). Sending now...')
+
+            # Send the resulting GIF
+            await retry_send_animation(context.bot, msg.chat_id, str(final_gif))
+            await msg.reply_text('Done!')
 
         except subprocess.CalledProcessError as e:
             logger.exception('ffmpeg failed: %s', e)

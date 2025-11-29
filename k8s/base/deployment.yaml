@@ -18,6 +18,8 @@ spec:
       serviceAccountName: video2gif-bot-sa
       securityContext:
         fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
       containers:
         - name: video2gif-bot
           image: dima032398485/vid2gif_bot:latest
