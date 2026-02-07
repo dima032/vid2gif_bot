@@ -35,14 +35,14 @@ if not TOKEN:
 
 # Maximum file size for Telegram (50MB)
 MAX_FILE_SIZE = 50 * 1024 * 1024
-# Preferred maximum GIF size for conversations (can be tuned via env var, MB)
-# Default raised per request to 5 MB
-MAX_GIF_SIZE = int(os.getenv('VIDEO2GIF_MAX_GIF_SIZE_MB', '5')) * 1024 * 1024
+# Recommended maximum GIF size for savable GIFs (10MB)
+MAX_GIF_SIZE = int(os.getenv('VIDEO2GIF_MAX_GIF_SIZE_MB', '10')) * 1024 * 1024
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        'Send me a video (or video file) and I will convert it to a GIF. Short clips work best.\n'
+        'Send me a video (or video file) and I will convert it to a silent mp4, so you can save it to your GIF tab. '
+        'Short clips work best.\n'
         'Note: the container must have ffmpeg installed.'
     )
 
@@ -51,30 +51,29 @@ def _check_ffmpeg():
     return shutil.which('ffmpeg') is not None
 
 
-def _run_ffmpeg_generate_palette(input_path: Path, palette_path: Path, max_duration: int | None, fps: int, scale_width: int | None):
+def _run_ffmpeg_convert_mp4(input_path: Path, out_path: Path, fps: int, scale_width: int | None):
+    # Use ceil(X/2)*2 to ensure dimensions are divisible by 2 for libx264
+    # The pad filter adds black borders if necessary, but maintains aspect ratio.
     vf_parts = [f'fps={fps}']
     if scale_width:
         vf_parts.append(f'scale={scale_width}:-1:flags=lanczos')
+    vf_parts.append('pad=ceil(iw/2)*2:ceil(ih/2)*2') # Ensure dimensions are even
     vf = ','.join(vf_parts)
-    cmd = ['ffmpeg', '-y', '-i', str(input_path)]
-    if max_duration:
-        cmd += ['-t', str(max_duration)]
-    cmd += ['-vf', vf + ',palettegen', str(palette_path)]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-
-def _run_ffmpeg_palette_use(input_path: Path, palette_path: Path, out_path: Path, max_duration: int | None, fps: int, scale_width: int | None):
-    vf_parts = [f'fps={fps}']
-    if scale_width:
-        vf_parts.append(f'scale={scale_width}:-1:flags=lanczos')
-    vf = ','.join(vf_parts)
     cmd = [
-        'ffmpeg', '-y', '-i', str(input_path), '-i', str(palette_path)
+        'ffmpeg', '-y', '-i', str(input_path),
+        '-vf', vf,
+        '-an',  # No audio
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',  # Faster encoding
+        '-crf', '28', # Higher CRF for smaller file size, adjust as needed
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',  # Web optimization
+        str(out_path)
     ]
-    if max_duration:
-        cmd += ['-t', str(max_duration)]
-    cmd += ['-lavfi', vf + '[x];[x][1:v]paletteuse', str(out_path)]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    if result.stderr:
+        logger.warning('ffmpeg stderr: %s', result.stderr)
 
 
 def _parse_ffprobe_fps(fps_str: str) -> float:
@@ -121,196 +120,23 @@ def _get_video_metadata(video_path: Path) -> dict | None:
         return None
 
 
-async def compress_gif(input_path, max_size=MAX_GIF_SIZE):
-    """Try several tools/strategies to reduce GIF size until it's <= max_size.
-
-    Strategies tried (in order):
-      1. gifsicle color reduction and optimization (fast, high quality)
-      2. ImageMagick convert with resize + color reduction + optimization
-      3. ffmpeg re-encode with progressively lower fps and width
-
-    Returns path to the (possibly new) GIF to send. If no tool is available or
-    compression can't reduce below max_size, returns original path.
-    """
-    inp = Path(input_path)
-    try:
-        size = inp.stat().st_size
-    except Exception:
-        logger.exception('Failed to stat input GIF %s', input_path)
-        return str(input_path)
-
-    if size <= max_size:
-        return str(input_path)
-
-    workdir = inp.parent
-    gifsicle = shutil.which('gifsicle')
-    convert = shutil.which('convert')
-
-    # Total time budget for compression (seconds)
-    time_budget = int(os.getenv('VIDEO2GIF_COMPRESS_TIME_SEC', '30'))
-    start_time = time.monotonic()
-
-    # split budget per stage to avoid earlier stages starving later ones
-    # give at least a few seconds per stage
-    per_stage = max(6, time_budget // 3)
-
-    # helper to compute time left
-    def time_left():
-        return time_budget - (time.monotonic() - start_time)
-
-    # 1) gifsicle: do color-preserving optimization first (fast, non-destructive)
-    #    Avoid aggressive color reduction (--colors) unless absolutely necessary
-    if gifsicle:
-        logger.info('Using gifsicle for compression (non-destructive optimize, then conservative lossy)')
-        try:
-            last = inp
-            # if little time left, skip gifsicle
-            if time_left() < 2:
-                logger.debug('Skipping gifsicle stage; not enough time left')
-            else:
-                # First try a non-color-changing optimize pass only
-                out = workdir / f'{inp.stem}_gfs_opt.gif'
-                cmd = [gifsicle, '--optimize=3', str(last), '-o', str(out)]
-                try:
-                    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-                    if out.exists():
-                        logger.info('gifsicle optimized %s size=%.1fKB', out.name, out.stat().st_size/1024)
-                        if out.stat().st_size <= max_size:
-                            logger.info('gifsicle optimize success: %s <= %d bytes', out, max_size)
-                            return str(out)
-                        last = out
-                except subprocess.TimeoutExpired:
-                    logger.debug('gifsicle optimize timeout')
-                except subprocess.CalledProcessError:
-                    logger.debug('gifsicle optimize attempt failed')
-
-                # If non-destructive optimize didn't help enough, fall back to conservative lossy
-                # Use conservative (small) lossy values to avoid severe quality loss / palette shifts
-                for lossy in (30, 20):
-                    if time_left() < 2:
-                        logger.warning('Compression time budget low, breaking lossy stage')
-                        break
-
-                    out = workdir / f'{inp.stem}_gfs_lossy_{lossy}.gif'
-                    cmd = [gifsicle, '--optimize=3', f'--lossy={lossy}', str(last), '-o', str(out)]
-                    try:
-                        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-                    except subprocess.TimeoutExpired:
-                        logger.debug('gifsicle lossy timeout for %s', out)
-                        continue
-                    except subprocess.CalledProcessError:
-                        logger.debug('gifsicle lossy attempt failed (possibly unsupported)')
-                        break
-
-                    if out.exists():
-                        logger.info('gifsicle produced %s size=%.1fKB', out.name, out.stat().st_size/1024)
-                    if out.exists() and out.stat().st_size <= max_size:
-                        logger.info('gifsicle lossy success: %s <= %d bytes', out, max_size)
-                        return str(out)
-                    last = out
-
-        except Exception:
-            logger.exception('gifsicle compression stage failed')
-
-    # 2) ImageMagick convert (just resize and optimize, preserve original colors)
-    if convert:
-        logger.info('Using ImageMagick convert for resizing')
-        try:
-            # Skip ImageMagick if almost no time left
-            if time_left() < 4:
-                logger.debug('Skipping ImageMagick stage; not enough time left')
-            else:
-                # Only use ImageMagick for resizing, keep original colors
-                for scale_pct in (75, 50):
-                    if time_left() < 3:
-                        logger.warning('Compression time budget low, breaking ImageMagick stage')
-                        break
-
-                    out = workdir / f'{inp.stem}_magick_{scale_pct}.gif'
-                    # Simple resize pipeline:
-                    # 1. Coalesce frames
-                    # 2. Just resize with Lanczos
-                    # 3. Optimize layers
-                    cmd = [
-                        convert, str(inp), '-coalesce',
-                        '-filter', 'Lanczos',
-                        '-resize', f'{scale_pct}%',
-                        '-layers', 'Optimize',
-                        str(out)
-                    ]
-
-                    try:
-                        # Give more time for quality color processing
-                        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-                    except subprocess.TimeoutExpired:
-                        logger.debug('ImageMagick timeout for scale=%d', scale_pct)
-                        continue
-                    except subprocess.CalledProcessError:
-                        logger.debug('ImageMagick failed for scale=%d', scale_pct)
-                        continue
-                    
-                    if out.exists():
-                        logger.info('ImageMagick produced %s size=%.1fKB', out.name, out.stat().st_size/1024)
-                        if out.stat().st_size <= max_size:
-                            logger.info('ImageMagick success: %s <= %d bytes', out, max_size)
-                            return str(out)
-
-        except subprocess.CalledProcessError:
-            logger.exception('ImageMagick stage failed')
-
-    # 3) Re-encode with ffmpeg lower fps/width using palette method
-    try:
-        logger.info('Trying ffmpeg re-encode compression')
-        # Prefer to keep more frames (higher fps) and only slowly reduce resolution.
-        # This makes the final GIF slightly larger but visually smoother.
-        for fps in (15, 14, 12, 10, 8):
-            for width in (480, 420, 360, 320, 240):
-                if time_left() < 4:
-                    logger.warning('Compression time budget low, breaking ffmpeg stage')
-                    break
-
-                pal = workdir / f'{inp.stem}_pal_{fps}_{width}.png'
-                candidate = workdir / f'{inp.stem}_ff_{fps}_{width}.gif'
-
-                try:
-                    logger.debug('ffmpeg palette gen fps=%d width=%s', fps, width)
-                    # run palette generation with a timeout
-                    try:
-                        _run_ffmpeg_generate_palette(inp, pal, None, fps, width)
-                    except Exception as e:
-                        logger.debug('ffmpeg palette generation failed: %s', e)
-                        continue
-
-                    try:
-                        _run_ffmpeg_palette_use(inp, pal, candidate, None, fps, width)
-                    except Exception as e:
-                        logger.debug('ffmpeg palette use failed: %s', e)
-                        continue
-
-                except Exception as ex:
-                    logger.debug('ffmpeg attempt failed for fps=%d width=%s: %s', fps, width, ex)
-                    continue
-
-                if candidate.exists():
-                    logger.info('ffmpeg produced %s size=%.1fKB', candidate.name, candidate.stat().st_size/1024)
-                    if candidate.stat().st_size <= max_size:
-                        logger.info('ffmpeg success: %s <= %d bytes', candidate, max_size)
-                        return str(candidate)
-
-    except Exception as e:
-        logger.exception('ffmpeg compression loop failed: %s', e)
-
-    # Nothing worked; return original GIF
-    return str(input_path)
 
 
-async def retry_send_animation(bot, chat_id, animation_path, max_retries=3):
+
+async def retry_send_animation(bot, chat_id, animation_path, max_retries=3, duration: int | None = None, width: int | None = None, height: int | None = None):
     """Retry sending animation with exponential backoff"""
     for attempt in range(max_retries):
         try:
             logger.info('Sending animation attempt %d: %s', attempt+1, animation_path)
             with open(animation_path, 'rb') as animation:
-                await bot.send_animation(chat_id=chat_id, animation=animation)
+                await bot.send_animation(
+                    chat_id=chat_id,
+                    animation=animation,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    write_timeout=120
+                )
             logger.info('send_animation call returned for attempt %d', attempt+1)
             return True
         except (TimedOut, NetworkError) as e:
@@ -371,12 +197,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_obj = msg.video.get_file()
     elif msg.document and (msg.document.mime_type or '').startswith('video'):
         file_obj = msg.document.get_file()
-    elif msg.animation:
-        # Already a gif/animation — just inform user
-        await msg.reply_text('This is already an animation/gif. I will resend it back to you.')
-        # forward original animation
-        await context.bot.send_animation(chat_id=msg.chat_id, animation=msg.animation.file_id)
-        return
     else:
         await msg.reply_text('Please send a video file (mp4, mov, webm, etc.) or a video document.')
         return
@@ -391,8 +211,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         in_path = td_path / 'input'
-        out_gif = td_path / 'out.gif'
-        palette = td_path / 'palette.png'
+        out_mp4 = td_path / 'out.mp4'
 
         # Download file with retries and backoff to handle transient network/timeouts
         f = await file_obj
@@ -430,17 +249,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             width = metadata['width']
             height = metadata['height']
 
-            # 1. Cap duration to a reasonable length for a GIF
-            max_duration = 15.0
-            if duration > max_duration:
-                await retry_send_text_by_msg(msg, f"Video is {duration:.1f}s long; trimming to {max_duration}s for the GIF.")
-                duration = max_duration
-            else:
-                max_duration = None  # Use full length if shorter than max
+            # max_duration = 15.0
+            # if duration > max_duration:
+            #     await retry_send_text_by_msg(msg, f"Video is {duration:.1f}s long; trimming to {max_duration}s.")
+            #     duration = max_duration
+            # else:
+            #     max_duration = None  # Use full length if shorter than max
+
 
             # 2. Iteratively adjust FPS and width to meet a "pixel budget"
             # This is a heuristic to estimate output size before conversion.
-            # A 480p, 15fps, 10s video is a good baseline (480*270*15*10 = ~20M "pixels")
             pixel_budget = 25_000_000
             pixel_score = width * height * fps * (duration or metadata['duration'])
 
@@ -449,53 +267,45 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # If the estimated "pixel score" is high, be more aggressive from the start.
             if pixel_score > pixel_budget and width > 320: # only if score is high and res is not already low
-                await retry_send_text_by_msg(msg, "Video has high resolution/fps. Applying smart compression to create a smaller GIF...")
-                
+                await retry_send_text_by_msg(msg, "Video has high resolution/fps. Applying smart compression...")
+
                 # Reduce width and fps based on how much it's over budget
                 reduction_factor = (pixel_score / pixel_budget) ** 0.5  # sqrt makes reduction less drastic
-                
+
                 scale_width = int(width / reduction_factor)
                 final_fps = int(fps / reduction_factor)
 
-                # Clamp to reasonable values for a GIF
+                # Clamp to reasonable values
                 scale_width = max(min(scale_width, 480), 320)  # Clamp between 320p and 480p width
-                final_fps = max(min(final_fps, 15), 10)  # Clamp between 10 and 15 fps
+                final_fps = max(min(final_fps, 25), 15)  # Clamp between 15 and 25 fps
             else:
                 # Looks good, use default high-quality settings
                 scale_width = min(width, 480)  # Don't upscale, but cap at 480p for sanity
-                final_fps = min(fps, 15)  # 15 fps is a good default for GIFs
+                final_fps = min(fps, 25)  # 25 fps is a good default for video
 
-            await retry_send_text_by_msg(msg, f'Converting to GIF ({scale_width}p width, {final_fps} fps)...')
-            
-            # Generate palette and then use it for better colors
-            _run_ffmpeg_generate_palette(infile_path, palette, max_duration, final_fps, scale_width)
-            logger.info('Palette generated: %s', palette)
-            _run_ffmpeg_palette_use(infile_path, palette, out_gif, max_duration, final_fps, scale_width)
-            
-            initial_size = out_gif.stat().st_size
-            logger.info('GIF generated: %s (size=%.1fKB)', out_gif.name, initial_size / 1024)
+            await retry_send_text_by_msg(msg, f'Converting to silent mp4 ({scale_width}p width, {final_fps} fps)...')
+
+            _run_ffmpeg_convert_mp4(infile_path, out_mp4, final_fps, scale_width)
+
+            initial_size = out_mp4.stat().st_size
+            logger.info('MP4 generated: %s (size=%.1fKB)', out_mp4.name, initial_size / 1024)
 
             # Check against Telegram's hard limit
             if initial_size > MAX_FILE_SIZE:
-                await msg.reply_text(f'Generated GIF is too large to send ({initial_size / 1024 / 1024:.1f} MB). Try a shorter clip.')
+                await msg.reply_text(f'Generated video is too large to send ({initial_size / 1024 / 1024:.1f} MB). Try a shorter clip.')
                 return
 
-            # Compress if needed to get under the preferred conversational size
-            if initial_size > MAX_GIF_SIZE:
-                await retry_send_text_by_msg(msg, f'Initial GIF is {initial_size / 1024 / 1024:.1f}MB, running post-compression...')
-            final_gif_path = await compress_gif(out_gif, max_size=MAX_GIF_SIZE)
-            
-            final_gif = Path(final_gif_path)
-            final_size = final_gif.stat().st_size
-            logger.info('Final GIF selected: %s size=%.1fKB', final_gif.name, final_size / 1024)
+            await retry_send_text_by_msg(msg, f'Sending animation: {out_mp4.name} ({initial_size/1024:.1f} KB).')
 
-            if final_size > MAX_GIF_SIZE:
-                await retry_send_text_by_msg(msg, f'Compressed GIF is still {final_size / 1024 / 1024:.1f}MB. Sending the smallest version we have.')
-            else:
-                await retry_send_text_by_msg(msg, f'Prepared GIF: {final_gif.name} ({final_size/1024:.1f} KB). Sending now...')
-
-            # Send the resulting GIF
-            await retry_send_animation(context.bot, msg.chat_id, str(final_gif))
+            # Send the resulting animation
+            await retry_send_animation(
+                context.bot,
+                msg.chat_id,
+                str(out_mp4),
+                duration=int(duration),
+                width=int(width),
+                height=int(height)
+            )
             await msg.reply_text('Done!')
 
         except subprocess.CalledProcessError as e:
@@ -541,7 +351,7 @@ def main():
         app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler('start', start))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO | filters.ANIMATION, handle_video))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
 
     # Register a global error handler so uncaught exceptions are logged and optionally reported to users
     app.add_error_handler(global_error_handler)

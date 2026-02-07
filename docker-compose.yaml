@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  video2gif-bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: video2gif-bot
+    environment:
+      # Mandatory Telegram Bot Token - REPLACE WITH YOUR ACTUAL TOKEN
+      - VIDEO2GIF_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_HERE
+
+      # Preferred maximum GIF size in MB (K8s deployment sets this to 3MB)
+      - VIDEO2GIF_MAX_GIF_SIZE_MB=3
+
+      # ImageMagick thread limit (from K8s deployment)
+      - MAGICK_THREAD_LIMIT=1
+      # OpenMP thread limit (from K8s deployment)
+      - OMP_NUM_THREADS=1
+
+      # Optional environment variables from main.py with their default values
+      # Uncomment and modify if you wish to override the defaults.
+      # - VIDEO2GIF_COMPRESS_TIME_SEC=30
+      # - VIDEO2GIF_MESSAGE_RETRIES=3
+      # - VIDEO2GIF_DOWNLOAD_RETRIES=3
+      # - VIDEO2GIF_CONNECT_TIMEOUT=5
+      # - VIDEO2GIF_READ_TIMEOUT=30
+      # - VIDEO2GIF_POOL_TIMEOUT=5
+      # - VIDEO2GIF_CONNECTION_POOL=8
+    # If you need to mount a volume for temporary storage, uncomment the following:
+    # volumes:
+    #   - bot_tmp_data:/app/tmp # Mount a volume for /app/tmp inside the container
+
+# Define named volumes if you uncommented them above
+# volumes:
+#   bot_tmp_data:
